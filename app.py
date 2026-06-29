@@ -16,8 +16,8 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 
-from database import init_db, save_submission, get_submission, update_status, save_appeal, appeal_exists, get_log
-from signals import llm_signal, stylometric_signal, combine
+from database import init_db, save_submission, get_submission, update_status, save_appeal, appeal_exists, get_log, get_analytics, is_verified, set_verified
+from signals import llm_signal, stylometric_signal, burstiness_signal, combine
 from labels import get_label
 
 load_dotenv()
@@ -82,7 +82,8 @@ def submit():
     # ── Run detection pipeline ──
     score_llm = llm_signal(text)
     stylo_result = stylometric_signal(text)
-    combined = combine(score_llm, stylo_result)
+    burst_result = burstiness_signal(text)
+    combined = combine(score_llm, stylo_result, burst_result)
 
     result = combined["result"]
     confidence = combined["confidence"]
@@ -96,6 +97,8 @@ def submit():
         result=result,
         confidence=confidence,
         llm_score=combined["score_llm"],
+        stylo_score=combined["score_stylo"],
+        burst_score=combined["score_burst"],
         label=label,
         short_text_warning=combined["short_text_warning"],
     )
@@ -108,6 +111,7 @@ def submit():
         "signals": {
             "llm": combined["score_llm"],
             "stylometric": combined["score_stylo"],
+            "burstiness": combined["score_burst"],
             "sub_signals": combined["sub_signals"],
         },
         "short_text_warning": combined["short_text_warning"],
@@ -205,6 +209,103 @@ def status(content_id):
         "status": submission["status"],
         "short_text_warning": bool(submission["short_text_warning"]),
         "created_at": submission["created_at"],
+    }), 200
+
+
+# ─────────────────────────────────────────────
+# GET /analytics  (stretch: analytics dashboard)
+# ─────────────────────────────────────────────
+
+@app.route("/analytics", methods=["GET"])
+def analytics():
+    """
+    Return detection pattern statistics across all submissions.
+
+    Metrics returned:
+      - total_submissions
+      - attribution_breakdown  (ai / uncertain / human counts + percentages)
+      - appeal_rate            (appeals / total_submissions)
+      - avg_confidence         (mean confidence score across all decisions)
+      - short_text_rate        (fraction of submissions that triggered the short-text warning)
+    """
+    data = get_analytics()
+    return jsonify(data), 200
+
+
+# ─────────────────────────────────────────────
+# POST /verify  (stretch: provenance certificate)
+# ─────────────────────────────────────────────
+
+@app.route("/verify", methods=["POST"])
+@limiter.limit("3 per hour")
+def verify():
+    """
+    Provenance certificate: a creator submits a live writing sample to earn
+    a Verified Human badge on their account.
+
+    Required JSON fields:
+      creator_id  (str) — the creator's identifier
+      sample      (str) — a live writing sample (min 150 words)
+
+    The sample is run through the full detection pipeline.  If the confidence
+    score is below 0.40 (signals lean human), the creator_id is marked as
+    verified in the database and all their future content labels will show
+    the Verified Human badge instead of the standard label.
+
+    A creator cannot re-verify once already verified.
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    creator_id = body.get("creator_id", "").strip()
+    sample = body.get("sample", "").strip()
+
+    if not creator_id:
+        return jsonify({"error": "'creator_id' is required"}), 400
+    if not sample:
+        return jsonify({"error": "'sample' is required"}), 400
+
+    word_count = len(sample.split())
+    if word_count < 150:
+        return jsonify({
+            "error": f"Sample must be at least 150 words (submitted: {word_count})",
+        }), 400
+
+    if is_verified(creator_id):
+        return jsonify({
+            "verified": True,
+            "message": "This creator is already verified.",
+            "creator_id": creator_id,
+        }), 200
+
+    # Run full pipeline on the sample
+    score_llm = llm_signal(sample)
+    stylo_result = stylometric_signal(sample)
+    burst_result = burstiness_signal(sample)
+    combined = combine(score_llm, stylo_result, burst_result)
+
+    confidence = combined["confidence"]
+    passed = confidence < 0.40   # below 0.40 → signals lean human
+
+    if passed:
+        set_verified(creator_id)
+
+    return jsonify({
+        "creator_id": creator_id,
+        "verified": passed,
+        "confidence": confidence,
+        "message": (
+            "Verification passed. Your content will now display a Verified Human badge."
+            if passed else
+            "Verification did not pass. The sample scored above the human threshold "
+            f"(confidence: {confidence}). You may rewrite and try again."
+        ),
+        "signals": {
+            "llm": combined["score_llm"],
+            "stylometric": combined["score_stylo"],
+            "burstiness": combined["score_burst"],
+        },
     }), 200
 
 

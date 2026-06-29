@@ -308,7 +308,61 @@ Text translated from another language often has unusual stylometric properties �
 
 ## Stretch feature planning
 
-*(Update this section before starting each stretch feature)*
+### Stretch 1: Ensemble detection (3+ signals)
+
+**Added signal:** Burstiness / vocabulary clustering (`burstiness_signal` in `signals.py`).
+
+**What it measures:** Variance in local type-token ratio (TTR) computed over a sliding window of 10 words. Human writers naturally cluster unusual vocabulary in bursts; AI text maintains a more uniform vocabulary density throughout. High window-TTR variance → human-like → low AI score.
+
+**Output:** `score_burst ∈ [0, 1]`. Window TTR variance is clamped to [0, 0.04], then inverted: `(0.04 - variance) / 0.04`.
+
+**Updated ensemble weights:**
+| Signal | Normal weight | Short-text weight | Rationale |
+|--------|--------------|-------------------|-----------|
+| LLM (Groq) | 55% | 85% | Strongest single signal; captures semantics holistically |
+| Stylometric | 30% | 10% | Independent structural check; unreliable on short text |
+| Burstiness | 15% | 5% | Adds genuine signal on longer texts; too noisy on short ones |
+
+**Short-text threshold:** < 80 words or < 5 sentences triggers the short-text fallback weights.
+
+---
+
+### Stretch 2: Analytics dashboard
+
+**Endpoint:** `GET /analytics`
+
+**Metrics returned:**
+- `total_submissions` — total decisions made
+- `attribution_breakdown` — counts and percentages for ai / uncertain / human
+- `appeal_count` and `appeal_rate` (appeals / total)
+- `avg_confidence` — mean confidence score across all decisions
+- `short_text_rate` — fraction of submissions that triggered the short-text warning
+- `verified_creators` — count of creators who passed the provenance certificate
+
+**Implementation:** Pure SQLite aggregation queries in `get_analytics()` in `database.py`. No new dependencies.
+
+**Why appeal_rate as the extra metric:** A rising appeal rate is the primary signal that detection quality is degrading — either due to a new AI writing style, a shift in user demographics, or a calibration error. It's the most actionable single metric for a platform operator.
+
+---
+
+### Stretch 3: Provenance certificate
+
+**Endpoint:** `POST /verify`
+
+**Verification step:** Creator submits a live writing sample (minimum 150 words). The full 3-signal pipeline runs on the sample. If `confidence < 0.40` (signals lean human), the `creator_id` is stored in a `verified_creators` table and all future content from that creator receives the Verified Human label variant.
+
+**Label text (Verified Human):**
+> Attribution: Verified Human ✓
+> This creator has completed Provenance Guard's human verification step. They submitted a live writing sample that scored below the AI threshold, and their identity has been confirmed under their verified account.
+> Verification reduces the likelihood of misclassification but does not guarantee all content from this creator is human-written.
+
+**Constraints:**
+- Minimum 150 words enforced — too short and the pipeline can't make a reliable judgment
+- A creator already verified gets a 200 with `"verified": true` rather than an error
+- Rate limited to 3 attempts per hour to prevent brute-forcing with different samples
+- Verification is per `creator_id`, not per content item
+
+**Limitation acknowledged:** In this implementation there is no authentication — the `creator_id` is caller-supplied. A production system would tie verification to an authenticated session.
 
 ---
 

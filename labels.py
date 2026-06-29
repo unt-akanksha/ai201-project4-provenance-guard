@@ -1,14 +1,18 @@
 """
 labels.py — Transparency label text for Provenance Guard.
 
-Three variants, verbatim from planning.md.
+Four variants, verbatim from planning.md:
+  "ai"       — high-confidence AI-generated
+  "uncertain" — system cannot confidently attribute
+  "human"    — high-confidence human-written
+  "verified" — creator has passed the provenance certificate step (stretch feature)
 """
 
 
 def get_label(result: str) -> str:
     """
     Return the transparency label text for a given result tier.
-    result must be one of: "ai", "uncertain", "human"
+    result must be one of: "ai", "uncertain", "human", "verified"
     """
     if result == "ai":
         return (
@@ -27,6 +31,15 @@ def get_label(result: str) -> str:
             "genuinely difficult, and this label simply means we don't know.\n\n"
             "If you feel this label is wrong, you can submit an appeal to have a human "
             "reviewer look at your content."
+        )
+    elif result == "verified":
+        return (
+            "Attribution: Verified Human ✓\n\n"
+            "This creator has completed Provenance Guard's human verification step. "
+            "They submitted a live writing sample that scored below the AI threshold, "
+            "and their identity has been confirmed under their verified account.\n\n"
+            "Verification reduces the likelihood of misclassification but does not "
+            "guarantee all content from this creator is human-written."
         )
     else:  # "human"
         return (

@@ -3,6 +3,12 @@ signals.py — Detection signals for Provenance Guard.
 
 Signal 1: LLM-based classifier via Groq (score_llm)
 Signal 2: Stylometric heuristics in pure Python (score_stylo)
+Signal 3: Burstiness / vocabulary clustering in pure Python (score_burst)
+
+Ensemble weights (normal text):
+  confidence = 0.55 * score_llm + 0.30 * score_stylo + 0.15 * score_burst
+Short-text fallback (< 80 words or < 5 sentences):
+  confidence = 0.85 * score_llm + 0.10 * score_stylo + 0.05 * score_burst
 """
 
 import json
@@ -157,35 +163,105 @@ def stylometric_signal(text: str) -> dict:
 
 
 # ─────────────────────────────────────────────
+# Signal 3: Burstiness / vocabulary clustering
+# ─────────────────────────────────────────────
+
+def _window_ttr(words: list[str], window: int = 10) -> list[float]:
+    """Compute TTR over a sliding window of `window` words."""
+    if len(words) < window:
+        return [len(set(w.lower() for w in words)) / len(words)] if words else [1.0]
+    ttrs = []
+    for i in range(len(words) - window + 1):
+        chunk = [w.lower() for w in words[i : i + window]]
+        ttrs.append(len(set(chunk)) / window)
+    return ttrs
+
+
+def burstiness_signal(text: str) -> dict:
+    """
+    Signal 3: Vocabulary burstiness.
+
+    Measures how much the local vocabulary diversity (TTR in a sliding window)
+    varies across the text.  Human writers tend to cluster unusual words — bursts
+    of rich vocabulary separated by plainer passages.  AI text tends to maintain
+    a more uniform vocabulary density throughout.
+
+    High variance in windowed TTR → human-like (bursty) → LOW AI score.
+    Low variance  in windowed TTR → AI-like   (uniform) → HIGH AI score.
+
+    Returns:
+        {
+            "score_burst": float [0, 1],   # higher = more likely AI
+            "low_confidence": bool,         # True if text is too short to be reliable
+            "window_ttr_variance": float,   # raw variance before normalisation
+        }
+    """
+    words = re.findall(r"\b\w+\b", text)
+    word_count = len(words)
+    low_confidence = word_count < 80
+
+    if word_count < 10:
+        return {"score_burst": 0.5, "low_confidence": True, "window_ttr_variance": 0.0}
+
+    window_size = min(10, word_count // 3)
+    ttrs = _window_ttr(words, window=window_size)
+
+    if len(ttrs) < 2:
+        variance = 0.0
+    else:
+        mean = sum(ttrs) / len(ttrs)
+        variance = sum((t - mean) ** 2 for t in ttrs) / len(ttrs)
+
+    # Clamp variance to [0, 0.04]; typical human range 0.01–0.04, AI < 0.01
+    clamped = _clamp(variance, 0.0, 0.04)
+    # Invert: low variance → high AI score
+    score_burst = round((0.04 - clamped) / 0.04, 4)
+
+    return {
+        "score_burst": score_burst,
+        "low_confidence": low_confidence,
+        "window_ttr_variance": round(variance, 6),
+    }
+
+
+# ─────────────────────────────────────────────
 # Confidence combiner
 # ─────────────────────────────────────────────
 
-def combine(score_llm: float, stylo_result: dict) -> dict:
+def combine(score_llm: float, stylo_result: dict, burst_result: dict) -> dict:
     """
-    Merge signal scores into a single confidence value and result tier.
+    Ensemble combiner: merge all three signal scores into a single confidence value.
 
-    Weights (from spec):
-      Normal:     confidence = 0.6 * llm + 0.4 * stylo
-      Short text: confidence = 0.85 * llm + 0.15 * stylo
+    Weights — normal text (>= 80 words, >= 5 sentences):
+      confidence = 0.55 * llm + 0.30 * stylo + 0.15 * burst
 
-    Thresholds:
-      >= 0.85  →  "ai"
-      0.35–0.84 → "uncertain"
+    Weights — short text (stylometric flagged low_confidence):
+      confidence = 0.85 * llm + 0.10 * stylo + 0.05 * burst
+
+    Rationale:
+      LLM signal carries the most weight because it captures semantics holistically
+      and is the most discriminative signal across text types.  Stylometric gets 30 %
+      as an independent structural check.  Burstiness gets 15 % — it adds genuine
+      signal on longer texts but is too noisy on short ones to weight heavily.
+      All weights drop to near-zero for non-LLM signals on short text because
+      stylometrics and burstiness both need sufficient word count to be meaningful.
+
+    Thresholds (calibrated from empirical testing):
+      >= 0.78  →  "ai"       (recalibrated from 0.85; 0.85 was unreachable in practice)
+      0.35–0.77 → "uncertain"
       < 0.35   →  "human"
     """
     score_stylo = stylo_result["score_stylo"]
+    score_burst = burst_result["score_burst"]
     short = stylo_result["low_confidence"]
 
     if short:
-        confidence = 0.85 * score_llm + 0.15 * score_stylo
+        confidence = 0.85 * score_llm + 0.10 * score_stylo + 0.05 * score_burst
     else:
-        confidence = 0.6 * score_llm + 0.4 * score_stylo
+        confidence = 0.55 * score_llm + 0.30 * score_stylo + 0.15 * score_burst
 
     confidence = round(confidence, 4)
 
-    # Thresholds calibrated from empirical signal ranges:
-    # Typical AI text produces combined scores of 0.75–0.85 with strong LLM + stylometric agreement.
-    # 0.85 (original spec) was unreachable in practice; recalibrated to 0.78.
     if confidence >= 0.78:
         result = "ai"
     elif confidence < 0.35:
@@ -199,5 +275,7 @@ def combine(score_llm: float, stylo_result: dict) -> dict:
         "short_text_warning": short,
         "score_llm": round(score_llm, 4),
         "score_stylo": score_stylo,
+        "score_burst": score_burst,
+        "window_ttr_variance": burst_result["window_ttr_variance"],
         "sub_signals": stylo_result["sub_signals"],
     }
